@@ -1,54 +1,35 @@
-# Stream — HTB (Linux, Release Arena)
+# Stream (HTB, Linux / Release Arena)
 
-AIDX ingest on FastAPI, a Spring `terminal-edge` gateway, and ClickHouse behind nginx.
-Two XML parsers on the same path give the box its shape: an **in-band XXE** that
-reads files for the user, and a **malformed-body** route that wakes a root-level
-DLQ drainer for root.
+AIDX ingest on FastAPI, Spring terminal-edge gateway, ClickHouse behind nginx.
+Dual-use XML: in-band XXE for user, malformed body → DLQ for root.
 
----
-
-## Box
+- [WRITEUP.md](WRITEUP.md) — chain (no flags, no live passwords)
+- [scripts/](scripts/) — heap extract, ingest, XXE+CH, su brute, /proc sniffer, FILE append
 
 | | |
 |---|---|
-| OS | Ubuntu · OpenSSH 9.6p1 |
-| Hosts | `htb-airport.htb` · `api.htb-airport.htb` · `db.htb-airport.htb` |
-| Entry | Unauth Spring `/actuator/heapdump` + `:8081/feeds/aidx` |
-| User | heap → ClickHouse `svc_events` → XXE `file://` in `<Airline>` → Kafka SASL = SSH `svc-infra` → local `su` |
-| Root | systemd DLQ timer as root + argv sniff of `clickhouse-client --password` + `GRANT FILE` on the formatter |
+| **OS** | Ubuntu, OpenSSH 9.6p1 |
+| **Hosts** | `htb-airport.htb`, `api.htb-airport.htb`, `db.htb-airport.htb` |
+| **Entry** | Unauthenticated Spring `/actuator/heapdump` + `:8081/feeds/aidx` |
+| **User** | heap → ClickHouse `svc_events` → XXE `file://` in `<Airline>` → Kafka SASL = SSH `svc-infra` → `su` |
+| **Root** | systemd DLQ timer as root + argv sniff of `clickhouse-client --password` + `GRANT FILE` on the formatter |
 
-> No flags, VPN configs, or live passwords in this tree.
+No flags, VPN configs, or live passwords in this tree.
 
----
-
-## Tree
-Stream/
-├── README.md · WRITEUP.md · secrets.example.env · .gitignore
-└── scripts/
-    ├── heap_extract.py · aidx_ingest.py · ch_http.py · xxe_read.py
-    ├── ch_file_append.py · replay.sh
-    ├── su_brute.py · proc_sniff.py         (target-side)
-    └── payloads/
-        ├── xxe-file.xml
-        └── dlq-malformed.xml
-        
 ---
 
 ## Scripts
 
-**Kali-side**
-
-- `heap_extract.py` — neighbourhood around Hikari setters in the heapdump
-- `aidx_ingest.py` — POST AIDX (plain / XXE / malformed → DLQ)
-- `ch_http.py` — ClickHouse HTTP Basic
-- `xxe_read.py` — ingest XXE + `SELECT flightleg_json.airline`
-- `ch_file_append.py` — `INSERT INTO FUNCTION file(...)` append
-- `replay.sh` — thin wrapper over the above
-
-**Target-side** (run over an SSH session)
-
-- `su_brute.py` — local `su` against a wordlist (fail2ban on `:22`)
-- `proc_sniff.py` — busy-loop `/proc/<pid>/cmdline`
+| File | Where | What |
+|---|---|---|
+| `scripts/heap_extract.py` | Kali | neighbourhood around Hikari setters in the heapdump |
+| `scripts/aidx_ingest.py` | Kali | POST AIDX (plain / XXE / malformed → DLQ) |
+| `scripts/ch_http.py` | Kali | ClickHouse HTTP Basic |
+| `scripts/xxe_read.py` | Kali | ingest XXE + `SELECT flightleg_json.airline` |
+| `scripts/su_brute.py` | target | local `su` against a wordlist (fail2ban on `:22`) |
+| `scripts/proc_sniff.py` | target | busy-loop `/proc/<pid>/cmdline` |
+| `scripts/ch_file_append.py` | Kali | `INSERT INTO FUNCTION file(...)` append |
+| `scripts/replay.sh` | Kali | thin wrapper over the above |
 
 ---
 
@@ -57,7 +38,39 @@ Stream/
 ```bash
 echo '<TARGET_IP> htb-airport.htb api.htb-airport.htb db.htb-airport.htb' | sudo tee -a /etc/hosts
 export TARGET=<TARGET_IP>
-
 ./scripts/replay.sh heap
 export CH_PASS=...          # setPassword next to setUsername svc_events
 ./scripts/replay.sh xxe /opt/kafka_2.13-4.3.1/config/server.properties
+```
+
+---
+
+## Tree
+
+```
+Stream/
+├── README.md
+├── WRITEUP.md
+├── secrets.example.env
+├── .gitignore
+└── scripts/
+    ├── heap_extract.py
+    ├── aidx_ingest.py
+    ├── ch_http.py
+    ├── xxe_read.py
+    ├── su_brute.py
+    ├── proc_sniff.py
+    ├── ch_file_append.py
+    ├── replay.sh
+    └── payloads/
+        ├── xxe-file.xml
+        └── dlq-malformed.xml
+```
+
+---
+
+## Notes
+
+- `scripts/` is Kali-side except `su_brute.py` and `proc_sniff.py`, which run **on the target** over an existing SSH session.
+- `scripts/payloads/` holds the two canned XML bodies: the in-band XXE carrier and the malformed AIDX that seeds the DLQ.
+- `secrets.example.env` is a template; `secrets.env` is gitignored.
