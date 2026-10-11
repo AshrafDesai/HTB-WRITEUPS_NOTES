@@ -22,27 +22,15 @@ DLQ drainer for root.
 ---
 
 ## Tree
-'''
 Stream/
-├── README.md
-├── WRITEUP.md
-├── secrets.example.env
-├── .gitignore
+├── README.md · WRITEUP.md · secrets.example.env · .gitignore
 └── scripts/
-├── heap_extract.py
-├── aidx_ingest.py
-├── ch_http.py
-├── xxe_read.py
-├── su_brute.py
-├── proc_sniff.py
-├── ch_file_append.py
-├── replay.sh
-└── payloads/
-├── xxe-file.xml
-└── dlq-malformed.xml
-'''
-
-
+    ├── heap_extract.py · aidx_ingest.py · ch_http.py · xxe_read.py
+    ├── ch_file_append.py · replay.sh
+    ├── su_brute.py · proc_sniff.py         (target-side)
+    └── payloads/
+        ├── xxe-file.xml
+        └── dlq-malformed.xml
 ---
 
 ## Scripts
